@@ -30,17 +30,13 @@ function getCookie(cookie, name)
 end
 
 
-if not uids then
-  uids    = {}
-  newuid  = false
-end
-
-maxuids = 10
+local uids    = {}
+local maxuids = 2
 
 
-if newuid and response then
-  if response.headers['Set-Cookie'] then
-    local uid = getCookie(response.headers['Set-Cookie'][1], 'uid')
+function response(res, state)
+  if state.newuid and res.headers['Set-Cookie'] then
+    local uid = getCookie(res.headers['Set-Cookie'][1], 'uid')
 
     if uid ~= nil then
       if #uids < maxuids then
@@ -54,17 +50,22 @@ if newuid and response then
 end
 
 
-request = {
-  ['method' ] = 'GET',
-  ['url'    ] = 'http://london.spotmx.com:9080' .. urls[math.random(#urls)],
-  ['headers'] = {}
-}
+function request(state)
+  local req = {
+    ['method' ] = 'GET',
+    ['url'    ] = 'http://london.spotmx.com:9080' .. urls[math.random(#urls)],
+    ['headers'] = {}
+  }
 
--- Have at least maxuids uid's before we start reusing.
-if #uids >= maxuids and math.random(100) > 20 then -- 20% chance to be a new user.
-  newuid = false
-  request.headers['Cookie'] = 'uid=' .. uids[math.random(#uids)]
-else
-  newuid = true
+  -- Have at least maxuids uid's before we start reusing.
+  if #uids >= maxuids and math.random(100) > 20 then -- 20% chance to be a new user.
+    state.newuid = false
+
+    req.headers['Cookie'] = 'uid=' .. uids[math.random(#uids)]
+  else
+    state.newuid = true
+  end
+
+  return req
 end
 
