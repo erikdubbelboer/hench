@@ -11,10 +11,13 @@ import (
   "sort"
   "strconv"
   "runtime"
+  "strings"
 
   "os"
   "os/signal"
 
+  "net"
+  "net/url"
   "net/http"
 
   "github.com/aarzilli/golua/lua"
@@ -25,10 +28,11 @@ type Timings []time.Duration
 
 
 var (
-  verbose = flag.Bool("verbose", false, "Verbose output.")
-
   L     *lua.State
   LLock sync.Mutex
+
+  dnsCache     = make(map[string]string, 0)
+  dnsCacheLock sync.RWMutex
 
   timings     Timings
   timingsLock sync.Mutex
@@ -47,6 +51,65 @@ func (t Timings) Swap(i, j int) {
 
 func (t Timings) Less(i, j int) bool {
   return t[i] < t[j]
+}
+
+
+func resolveUrl(surl string) (string, error) {
+  var host string
+  var port string
+  var ip   string
+  var ok   bool
+
+  purl, err := url.Parse(surl)
+  if err != nil {
+    return "", err
+  }
+
+  if strings.Contains(purl.Host, ":") {
+    host, port, err = net.SplitHostPort(purl.Host)
+    if err != nil {
+      return "", err
+    }
+  } else {
+    host = purl.Host
+  }
+
+  if isIp := net.ParseIP(host); isIp != nil {
+    return surl, nil
+  }
+
+  dnsCacheLock.RLock()
+  {
+    ip, ok = dnsCache[host]
+  }
+  dnsCacheLock.RUnlock()
+
+  if !ok {
+    ips, err := net.LookupIP(host)
+    if err != nil {
+      return "", err
+    }
+
+    if len(ips) == 0 {
+      return "", fmt.Errorf("failed to lookup %s", host)
+    }
+
+    ip = ips[0].String()
+
+    dnsCacheLock.Lock()
+    {
+      dnsCache[host] = ip
+    }
+    dnsCacheLock.Unlock()
+  }
+
+  purl.Host = ip
+
+  if port != "" {
+    purl.Host += ":" + port
+  }
+
+  return purl.String(), nil
 }
 
 
@@ -86,7 +149,6 @@ func worker(n int, sleep time.Duration, done chan struct{}) {
     var (
       next = time.Now().Add(sleep)
       req  *http.Request
-      err  error
     )
 
 
@@ -122,13 +184,12 @@ func worker(n int, sleep time.Duration, done chan struct{}) {
         log.Fatal(fmt.Errorf("url is not a string"))
       }
 
-      url := L.ToString(-1)
+      url, err := resolveUrl(L.ToString(-1))
+      if err != nil {
+        log.Fatal(err)
+      }
       L.Pop(1)
 
-
-      if *verbose {
-        log.Printf("%s %s\n", method, url)
-      }
 
       req, err = http.NewRequest(method, url, nil)
       if err != nil {
@@ -150,10 +211,6 @@ func worker(n int, sleep time.Duration, done chan struct{}) {
           name  := L.ToString(-2)
           value := L.ToString(-1)
           L.Pop(1)
-
-          if *verbose {
-            log.Printf("%s: %s\n", name, value)
-          }
 
           req.Header.Add(name, value)
         }
@@ -177,11 +234,6 @@ func worker(n int, sleep time.Duration, done chan struct{}) {
 
 
       res.Body.Close()
-
-
-      if *verbose {
-        log.Println(res.Status)
-      }
 
 
       LLock.Lock()
@@ -208,10 +260,6 @@ func worker(n int, sleep time.Duration, done chan struct{}) {
             L.PushInteger(int64(i + 1))
             L.PushString(value)
             L.RawSet(-3)
-
-            if *verbose {
-              log.Printf("%s: %s\n", name, value)
-            }
           }
 
           L.RawSet(-3)
@@ -231,9 +279,7 @@ func worker(n int, sleep time.Duration, done chan struct{}) {
       LLock.Unlock()
     }
 
-    delay := next.Sub(time.Now())
-
-    if delay <= 0 {
+    if delay := next.Sub(time.Now()); delay <= 0 {
       select {
       case <- done:
         return
@@ -243,7 +289,7 @@ func worker(n int, sleep time.Duration, done chan struct{}) {
       select {
       case <-done:
         return
-      case <- time.After(next.Sub(time.Now())):
+      case <- time.After(delay):
       }
     }
   }
@@ -261,7 +307,6 @@ func main() {
   fmt.Printf("starting %d workers for %d requests per second\n", *workers, *rps)
 
   L = lua.NewState()
-  defer L.Close()
   L.OpenLibs()
 
   if err := L.DoFile(*script); err != nil {
@@ -269,7 +314,6 @@ func main() {
   }
 
   done  := make([]chan struct{}, *workers)
-  print := make(chan struct{}, 0)
   start := time.Now()
 
   for i := 0; i < *workers; i++ {
@@ -279,43 +323,41 @@ func main() {
   }
 
 
-  go func() {
-    r := 0
-
-    for {
-      select {
-      case <-time.After(time.Second):
-      case <-print:
-        return
-      }
-
-      nr := len(timings)
-      s  := "      " + fmt.Sprint(time.Duration(time.Now().Sub(start) / time.Second) * time.Second)
-
-      fmt.Printf("%s: %d requests\n", s[len(s) - 6:], nr - r)
-      r = nr
-    }
-  }()
-
-
+  r := 0
   c := make(chan os.Signal, 1)
   signal.Notify(c, os.Interrupt)
-  for _ = range c {
-    break
+
+print:
+  for {
+    time.Sleep(time.Second)
+
+    select {
+    case <-c:
+      break print
+    default:
+    }
+
+    timingsLock.Lock()
+    nr := len(timings)
+    timingsLock.Unlock()
+
+    s := "      " + fmt.Sprint(time.Duration(time.Now().Sub(start) / time.Second) * time.Second)
+
+    fmt.Printf("%s: %d requests\n", s[len(s) - 6:], nr - r)
+    r = nr
   }
 
-  print <- struct{}{}
 
+  // Stop all workers.
   for _, d := range done {
     d <- struct{}{}
   }
 
+
   duration := time.Duration(time.Now().Sub(start) / time.Second) * time.Second
   ps       := float64(len(timings)) / (float64(duration) / float64(time.Second))
 
-
   sort.Sort(timings)
-
 
   fmt.Printf("\n%d requests in %v\n"  , len(timings), duration)
   fmt.Printf("%d errors\n"            , errors)
