@@ -23,7 +23,7 @@ import (
   "net/url"
   "net/http"
 
-  "github.com/aarzilli/golua/lua"
+  "github.com/spotmx/golua/lua"
 )
 
 
