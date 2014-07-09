@@ -5,6 +5,12 @@ hench
 The Http bENCHmark tool.
 
 
+Installing (requires go 1.2 or newer):
+```bash
+$ GOPATH=`pwd` go get github.com/spotmx/hench
+$ sudo cp bin/hench /usr/local/bin/
+```
+
 Running:
 ```bash
 $ ./hench -rps=1 -script=simple.lua

@@ -156,7 +156,9 @@ func worker(n int, sleep time.Duration, done chan struct{}) {
       }
 
       L.GetGlobal(state)
-      L.Call(1, 1)
+      if err := L.Call(1, 1); err != nil {
+        log.Fatal(err)
+      }
 
       if !L.IsTable(-1) {
         log.Fatal(fmt.Errorf("request did not return a table but a %s", L.Typename(int(L.Type(-1)))))
@@ -253,7 +255,7 @@ func worker(n int, sleep time.Duration, done chan struct{}) {
         L.CreateTable(0, len(res.Header))
 
         for name, values := range res.Header {
-          L.PushString(name)
+          L.PushString(strings.ToLower(name))
           L.CreateTable(len(values), 0)
 
           for i, value := range values {
@@ -268,7 +270,9 @@ func worker(n int, sleep time.Duration, done chan struct{}) {
         L.RawSet(-3)
 
         L.GetGlobal(state)
-        L.Call(2, 1)
+        if err := L.Call(2, 1); err != nil {
+          log.Fatal(err)
+        }
 
         if !L.IsBoolean(-1) || !L.ToBoolean(-1) {
           atomic.AddUint64(&errors, 1)

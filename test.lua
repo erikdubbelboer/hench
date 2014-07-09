@@ -1,4 +1,7 @@
 
+require 'tools'
+
+
 local counter = 0
 
 
@@ -27,6 +30,11 @@ function response(res, state)
   end
   if res.body ~= tostring(state.counter) then
     print('expected res.body to be ' .. state.counter .. ' not ' .. res.body)
+  end
+
+  local foo = getCookie(res.headers, 'foo')
+  if foo ~= 'bar' then
+    print('expected foo cookie to be "bar" not ' .. tostring(foo))
   end
 
   return true

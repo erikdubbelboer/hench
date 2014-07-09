@@ -11,13 +11,16 @@ if (cluster.isMaster) {
 } else {
   http.createServer(function (req, res) {
     if (req.url == '/test') {
+      res.writeHead(200, {
+        'Set-Cookie': 'foo=bar'
+      });
       res.end(req.headers['x-test'])
     } else {
       console.log(req.method + ' ' + req.url)
       console.log(req.headers)
 
       res.writeHead(200, {
-        'X-Foo': ['bar', 'baz']
+        'X-Foo': ['bar', 'baz'],
       });
       res.end('test');
     }
