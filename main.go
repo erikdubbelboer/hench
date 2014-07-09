@@ -7,14 +7,17 @@ import (
   "log"
   "flag"
   "time"
-  "sync"
   "sort"
   "strconv"
-  "runtime"
   "strings"
+
+  "sync"
+  "sync/atomic"
 
   "os"
   "os/signal"
+
+  "io/ioutil"
 
   "net"
   "net/url"
@@ -34,10 +37,11 @@ var (
   dnsCache     = make(map[string]string, 0)
   dnsCacheLock sync.RWMutex
 
-  timings     Timings
-  timingsLock sync.Mutex
+  timingChan = make(chan time.Duration, 64)
 
   errors = uint64(0)
+
+  client *http.Client
 )
 
 
@@ -113,7 +117,7 @@ func resolveUrl(surl string) (string, error) {
 }
 
 
-func do(client *http.Client, req *http.Request) (res *http.Response, err error) {
+func do(req *http.Request) (res *http.Response, err error) {
   defer func() {
     if r := recover(); r != nil {
       err = fmt.Errorf("%v", r)
@@ -136,14 +140,6 @@ func worker(n int, sleep time.Duration, done chan struct{}) {
     L.SetGlobal(state)
   }
   LLock.Unlock()
-
-  client := &http.Client{
-    Jar      : nil,
-    Transport: &http.Transport{
-      DisableKeepAlives    : true,
-      DisableCompression   : false,
-    },
-  }
 
   for {
     var (
@@ -223,16 +219,16 @@ func worker(n int, sleep time.Duration, done chan struct{}) {
 
     start := time.Now()
 
-    if res, err := do(client, req); err != nil {
-      log.Println(err)
+    if res, err := do(req); err != nil {
+      log.Fatal(err)
     } else {
-      timing := time.Now().Sub(start)
-
-      timingsLock.Lock()
-      timings = append(timings, timing)
-      timingsLock.Unlock()
+      timingChan <- time.Now().Sub(start)
 
 
+      body, err := ioutil.ReadAll(res.Body)
+      if err != nil {
+        log.Fatal(err)
+      }
       res.Body.Close()
 
 
@@ -247,6 +243,10 @@ func worker(n int, sleep time.Duration, done chan struct{}) {
 
         L.PushString("status")
         L.PushInteger(int64(res.StatusCode))
+        L.RawSet(-3)
+
+        L.PushString("body")
+        L.PushString(string(body))
         L.RawSet(-3)
 
         L.PushString("headers")
@@ -271,7 +271,7 @@ func worker(n int, sleep time.Duration, done chan struct{}) {
         L.Call(2, 1)
 
         if !L.IsBoolean(-1) || !L.ToBoolean(-1) {
-          errors++
+          atomic.AddUint64(&errors, 1)
         }
 
         L.Pop(1) // Pop the return value of the stack.
@@ -297,20 +297,36 @@ func worker(n int, sleep time.Duration, done chan struct{}) {
 
 
 func main() {
-  workers := flag.Int   ("workers", runtime.GOMAXPROCS(0) * 20, "Number of workers to use (number of concurrent requests).")
-  rps     := flag.Int   ("rps"    , 10                        , "Requests per second.")
-  script  := flag.String("script" , "simple.lua"              , "The lua script to run.")
+  keepalive := flag.Bool  ("keepalive", true        , "Use keepalive connections.")
+  rps       := flag.Int   ("rps"      , 10          , "The maximum number of requests per second.")
+  script    := flag.String("script"   , "simple.lua", "The lua script to run.")
+  workers   := flag.Int   ("workers"  , 100         , "Number of workers to use (number of concurrent requests).")
   flag.Parse()
+
+  // Don't start more workers than we want to do requests per second.
+  if *workers > *rps {
+    *workers = *rps
+  }
 
   sleep := time.Duration((float64(time.Second) * float64(*workers)) / float64(*rps))
 
-  fmt.Printf("starting %d workers for %d requests per second\n", *workers, *rps)
+  fmt.Printf("starting %d worker(s) for %d requests per second\n", *workers, *rps)
+  fmt.Printf("press Ctrl+C to stop and print statistics\n")
 
   L = lua.NewState()
   L.OpenLibs()
 
   if err := L.DoFile(*script); err != nil {
     log.Fatal(err)
+  }
+
+  client = &http.Client{
+    Jar      : nil,
+    Transport: &http.Transport{
+      DisableKeepAlives  : !(*keepalive),
+      DisableCompression : false,
+      MaxIdleConnsPerHost: 64,
+    },
   }
 
   done  := make([]chan struct{}, *workers)
@@ -321,6 +337,15 @@ func main() {
 
     go worker(i, sleep, done[i])
   }
+
+
+  timings := make(Timings, 0)
+
+  go func() {
+    for {
+      timings = append(timings, <-timingChan)
+    }
+  }()
 
 
   r := 0
@@ -337,11 +362,8 @@ print:
     default:
     }
 
-    timingsLock.Lock()
     nr := len(timings)
-    timingsLock.Unlock()
-
-    s := "      " + fmt.Sprint(time.Duration(time.Now().Sub(start) / time.Second) * time.Second)
+    s  := "      " + fmt.Sprint(time.Duration(time.Now().Sub(start) / time.Second) * time.Second)
 
     fmt.Printf("%s: %d requests\n", s[len(s) - 6:], nr - r)
     r = nr
@@ -360,7 +382,7 @@ print:
   sort.Sort(timings)
 
   fmt.Printf("\n%d requests in %v\n"  , len(timings), duration)
-  fmt.Printf("%d errors\n"            , errors)
+  fmt.Printf("%d error(s)\n"          , atomic.LoadUint64(&errors))
   fmt.Printf("requests/sec: %.2f\n"   , ps)
   fmt.Printf("latency distribution:\n")
   fmt.Printf("   50%% %v\n", timings[int(float64(len(timings)) * 0.50)])
