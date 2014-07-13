@@ -20,7 +20,6 @@ import (
   "io/ioutil"
 
   "net"
-  "net/url"
   "net/http"
 
   "github.com/spotmx/golua/lua"
@@ -42,6 +41,8 @@ var (
   errors = uint64(0)
 
   client *http.Client
+
+  printing = false
 )
 
 
@@ -58,28 +59,34 @@ func (t Timings) Less(i, j int) bool {
 }
 
 
-func resolveUrl(surl string) (string, error) {
+func luaPrint(L *lua.State) int {
+  if printing {
+    str := L.ToString(1)
+    fmt.Println(str)
+  }
+
+  return 1
+}
+
+
+func resolveDomain(domain string) (string, error) {
   var host string
   var port string
   var ip   string
   var ok   bool
+  var err  error
 
-  purl, err := url.Parse(surl)
-  if err != nil {
-    return "", err
-  }
-
-  if strings.Contains(purl.Host, ":") {
-    host, port, err = net.SplitHostPort(purl.Host)
+  if strings.Contains(domain, ":") {
+    host, port, err = net.SplitHostPort(domain)
     if err != nil {
       return "", err
     }
   } else {
-    host = purl.Host
+    host = domain
   }
 
   if isIp := net.ParseIP(host); isIp != nil {
-    return surl, nil
+    return domain, nil
   }
 
   dnsCacheLock.RLock()
@@ -98,7 +105,13 @@ func resolveUrl(surl string) (string, error) {
       return "", fmt.Errorf("failed to lookup %s", host)
     }
 
-    ip = ips[0].String()
+    // If it's an ipv6 address we need brackets around it.
+    if ipv4 := ips[0].To4(); ipv4 != nil {
+      ip = ipv4.String()
+    } else {
+      ip = "[" + ips[0].String() + "]"
+    }
+
 
     dnsCacheLock.Lock()
     {
@@ -107,13 +120,21 @@ func resolveUrl(surl string) (string, error) {
     dnsCacheLock.Unlock()
   }
 
-  purl.Host = ip
-
   if port != "" {
-    purl.Host += ":" + port
+    return ip + ":" + port, nil
+  } else {
+    return ip, nil
+  }
+}
+
+
+func cacheDial(network string, addr string) (net.Conn, error) {
+  url, err := resolveDomain(addr)
+  if err != nil {
+    return nil, err
   }
 
-  return purl.String(), nil
+  return net.Dial(network, url)
 }
 
 
@@ -130,7 +151,7 @@ func do(req *http.Request) (res *http.Response, err error) {
 }
 
 
-func worker(n int, sleep time.Duration, done chan struct{}) {
+func worker(n int, sleep time.Duration, stop chan struct{}) {
   state := "__state" + strconv.FormatInt(int64(n), 10)
 
 
@@ -182,13 +203,11 @@ func worker(n int, sleep time.Duration, done chan struct{}) {
         log.Fatal(fmt.Errorf("url is not a string"))
       }
 
-      url, err := resolveUrl(L.ToString(-1))
-      if err != nil {
-        log.Fatal(err)
-      }
+      url := L.ToString(-1)
       L.Pop(1)
 
 
+      var err error
       req, err = http.NewRequest(method, url, nil)
       if err != nil {
         log.Fatal(err)
@@ -285,13 +304,13 @@ func worker(n int, sleep time.Duration, done chan struct{}) {
 
     if delay := next.Sub(time.Now()); delay <= 0 {
       select {
-      case <- done:
+      case <-stop:
         return
       default:
       }
     } else {
       select {
-      case <-done:
+      case <-stop:
         return
       case <- time.After(delay):
       }
@@ -301,6 +320,7 @@ func worker(n int, sleep time.Duration, done chan struct{}) {
 
 
 func main() {
+  cachedns  := flag.Bool  ("cachedns" , true        , "Cache dns lookups (dns lookup time is included in the request time and might slow things down).")
   keepalive := flag.Bool  ("keepalive", true        , "Use keepalive connections.")
   rps       := flag.Int   ("rps"      , 10          , "The maximum number of requests per second.")
   script    := flag.String("script"   , "simple.lua", "The lua script to run.")
@@ -319,9 +339,15 @@ func main() {
 
   L = lua.NewState()
   L.OpenLibs()
+  L.Register("print", luaPrint)
 
   if err := L.DoFile(*script); err != nil {
     log.Fatal(err)
+  }
+
+  dial := net.Dial
+  if *cachedns {
+    dial = cacheDial
   }
 
   client = &http.Client{
@@ -330,24 +356,31 @@ func main() {
       DisableKeepAlives  : !(*keepalive),
       DisableCompression : false,
       MaxIdleConnsPerHost: 64,
+      Dial               : dial,
     },
   }
 
-  done  := make([]chan struct{}, *workers)
+  stop  := make(chan struct{})
   start := time.Now()
 
   for i := 0; i < *workers; i++ {
-    done[i] = make(chan struct{}, 0)
-
-    go worker(i, sleep, done[i])
+    go worker(i, sleep, stop)
   }
 
 
-  timings := make(Timings, 0)
+  timings := make(Timings, *workers)
 
   go func() {
+    safe := true
     for {
-      timings = append(timings, <-timingChan)
+      select {
+      case timing := <-timingChan:
+        if safe {
+          timings = append(timings, timing)
+        }
+      case <-stop:
+        safe = false
+      }
     }
   }()
 
@@ -373,14 +406,14 @@ print:
     r = nr
   }
 
+  printing = false
+  end     := time.Now()
 
   // Stop all workers.
-  for _, d := range done {
-    d <- struct{}{}
-  }
+  close(stop)
 
 
-  duration := time.Duration(time.Now().Sub(start) / time.Second) * time.Second
+  duration := time.Duration(end.Sub(start) / time.Second) * time.Second
   ps       := float64(len(timings)) / (float64(duration) / float64(time.Second))
 
   sort.Sort(timings)
