@@ -3,24 +3,20 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io/ioutil"
 	"log"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
 	"sort"
 	"strconv"
 	"strings"
-	"time"
-
 	"sync"
 	"sync/atomic"
+	"time"
 
-	"os"
-	"os/signal"
-
-	"io/ioutil"
-
-	"net"
-	"net/http"
-
-	"github.com/spotmx/golua/lua"
+	"github.com/aarzilli/golua/lua"
 )
 
 type Timings []time.Duration
