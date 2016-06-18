@@ -15,6 +15,18 @@ if (cluster.isMaster) {
         'Set-Cookie': 'foo=bar'
       });
       res.end(req.headers['x-test'])
+		} else if (req.url == '/json') {
+			var body = [];
+			req.on('data', function(chunk) {
+				body.push(chunk);
+			}).on('end', function() {
+				body = Buffer.concat(body).toString();
+
+				console.log(body);
+
+				res.writeHead(200, {});
+				res.end(JSON.stringify({ bar: 'foo' }));
+			});
     } else {
       console.log(req.method + ' ' + req.url)
       console.log(req.headers)

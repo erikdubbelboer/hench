@@ -2,12 +2,14 @@
 function request(state)
   return {
     ['method' ] = 'GET',
-    ['url'    ] = 'https://www.google.com'
+    ['url'    ] = 'http://127.0.0.1:9090/'
   }
 end
 
-
 function response(res, state)
-  return res.status == 200
+	print('body: ')
+	println(res.body)
+
+  return true
 end
 

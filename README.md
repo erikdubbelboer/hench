@@ -5,39 +5,30 @@ hench
 The Http bENCHmark tool.
 
 
-Installing (requires go 1.2 or newer):
+Installing (requires go 1.4 or newer):
 ```bash
-$ GOPATH=`pwd` go get github.com/atomx/hench
-$ sudo cp bin/hench /usr/local/bin/
+go get github.com/atomx/hench
 ```
 
 Running:
 ```bash
-$ ./hench -rps=1 -script=simple.lua
+hench -rps=1 -script=example.lua
 ```
 
 Usage:
 ```bash
-$ ./hench -h
-Usage of ./hench:
-  -keepalive=true: Use keepalive connections.
-  -rps=10: Maximum number of requests per second.
-  -script="simple.lua": The lua script to run.
-  -workers=100: Number of workers to use (number of concurrent requests).
+Usage of hench:
+  -cachedns
+        Cache dns lookups (dns lookup time is included in the request time and might slow things down) (default true)
+  -compression
+        Enable or disable compression (default true)
+  -keepalive
+        Use keepalive connections (default true)
+  -rps int
+        The maximum number of requests per second (default 10)
+  -script string
+        Optional Lua script to run
+  -workers int
+        Number of workers to use (number of concurrent requests) (default 100)
 ```
-
-
-Pushing it to the max
----------------------
-
-```bash
-$ ulimit -n 100000
-$ GOMAXPROCS=`cat /proc/cpuinfo | grep processor | wc -l` ./hench -rps=10000 -workers=200 -script=simple.lua
-```
-
-You might need to run this as root because of the ulimit.
-
-You might also need to increase `-rps` if it's already reaching the 10000.
-
-Now increase `-workers` until the number of requests per second doesn't go any higher.
 

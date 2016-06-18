@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"net"
@@ -16,310 +17,204 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/aarzilli/golua/lua"
+	"github.com/cjoudrey/gluahttp"
+	"github.com/cjoudrey/gluaurl"
+	"github.com/erikdubbelboer/hench/internal/ratelimit"
+	"github.com/yuin/gopher-lua"
+
+	gluajson "github.com/layeh/gopher-json"
 )
 
-type Timings []time.Duration
-
 var (
-	L     *lua.State
+	L     *lua.LState
 	LLock sync.Mutex
 
-	dnsCache     = make(map[string]string, 0)
-	dnsCacheLock sync.RWMutex
+	durationChan = make(chan time.Duration, 0)
 
-	timingChan = make(chan time.Duration, 64)
-
-	errors = uint64(0)
+	errorsN = uint64(0)
 
 	client *http.Client
 
-	printing = false
+	rate *ratelimit.Limiter
+
+	start sync.WaitGroup
+	stop  = make(chan lua.LValue, 0)
 )
 
-func (t Timings) Len() int {
-	return len(t)
-}
-
-func (t Timings) Swap(i, j int) {
-	t[i], t[j] = t[j], t[i]
-}
-
-func (t Timings) Less(i, j int) bool {
-	return t[i] < t[j]
-}
-
-func luaPrint(L *lua.State) int {
-	if printing {
-		str := L.ToString(1)
-		fmt.Println(str)
-	}
+func luaPrint(L *lua.LState) int {
+	fmt.Print(L.Get(1).String())
 
 	return 1
 }
 
-func resolveDomain(domain string) (string, error) {
-	var host string
-	var port string
-	var ip string
-	var ok bool
-	var err error
+func luaPrintln(L *lua.LState) int {
+	fmt.Println(L.Get(1).String())
 
-	if strings.Contains(domain, ":") {
-		host, port, err = net.SplitHostPort(domain)
-		if err != nil {
-			return "", err
-		}
-	} else {
-		host = domain
-	}
-
-	if isIp := net.ParseIP(host); isIp != nil {
-		return domain, nil
-	}
-
-	dnsCacheLock.RLock()
-	{
-		ip, ok = dnsCache[host]
-	}
-	dnsCacheLock.RUnlock()
-
-	if !ok {
-		ips, err := net.LookupIP(host)
-		if err != nil {
-			return "", err
-		}
-
-		if len(ips) == 0 {
-			return "", fmt.Errorf("failed to lookup %s", host)
-		}
-
-		// If it's an ipv6 address we need brackets around it.
-		if ipv4 := ips[0].To4(); ipv4 != nil {
-			ip = ipv4.String()
-		} else {
-			ip = "[" + ips[0].String() + "]"
-		}
-
-		dnsCacheLock.Lock()
-		{
-			dnsCache[host] = ip
-		}
-		dnsCacheLock.Unlock()
-	}
-
-	if port != "" {
-		return ip + ":" + port, nil
-	} else {
-		return ip, nil
-	}
+	return 1
 }
 
-func cacheDial(network string, addr string) (net.Conn, error) {
-	url, err := resolveDomain(addr)
+func luaExit(L *lua.LState) int {
+	c, _ := L.Get(1).(lua.LNumber)
+	os.Exit(int(c))
+
+	return 1
+}
+
+func buildRequest(stateName string) *http.Request {
+	LLock.Lock()
+	defer LLock.Unlock()
+
+	if err := L.CallByParam(lua.P{
+		Fn:      L.GetGlobal("request"),
+		NRet:    1,
+		Protect: true,
+	}, L.GetGlobal(stateName)); err != nil {
+		log.Fatal(err)
+	}
+
+	tableVal := L.Get(-1)
+
+	if tableVal.Type() != lua.LTTable {
+		log.Fatal(fmt.Errorf("request did not return a table but a %s", tableVal.Type()))
+	}
+
+	table := tableVal.(*lua.LTable)
+
+	method := table.RawGet(lua.LString("method"))
+	url := table.RawGet(lua.LString("url"))
+	body := table.RawGet(lua.LString("body"))
+
+	var bodyReader io.Reader
+
+	if body.Type() != lua.LTNil {
+		bodyReader = strings.NewReader(body.String())
+	}
+
+	req, err := http.NewRequest(method.String(), url.String(), bodyReader)
 	if err != nil {
-		return nil, err
+		log.Fatal(err)
 	}
 
-	return net.Dial(network, url)
+	headers := table.RawGet(lua.LString("headers"))
+
+	if h, ok := headers.(*lua.LTable); ok {
+		h.ForEach(func(key, value lua.LValue) {
+			req.Header.Add(key.String(), value.String())
+		})
+	}
+
+	L.Pop(1)
+
+	return req
 }
 
-func do(req *http.Request) (res *http.Response, err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			err = fmt.Errorf("%v", r)
+func handleResponse(res *http.Response, stateName string) {
+	body, err := ioutil.ReadAll(res.Body)
+	if err != nil {
+		log.Fatal(err)
+	}
+	res.Body.Close()
+
+	LLock.Lock()
+	defer LLock.Unlock()
+
+	headers := L.NewTable()
+
+	for name, values := range res.Header {
+		header := L.NewTable()
+
+		for _, value := range values {
+			header.Append(lua.LString(value))
 		}
-	}()
 
-	res, err = client.Do(req)
+		headers.RawSet(lua.LString(strings.ToLower(name)), header)
+	}
 
-	return
+	table := L.NewTable()
+
+	table.RawSet(lua.LString("status"), lua.LNumber(res.StatusCode))
+	table.RawSet(lua.LString("body"), lua.LString(body))
+	table.RawSet(lua.LString("headers"), headers)
+
+	if err := L.CallByParam(lua.P{
+		Fn:      L.GetGlobal("response"),
+		NRet:    1,
+		Protect: true,
+	}, table, L.GetGlobal(stateName)); err != nil {
+		log.Fatal(err)
+	}
+
+	if ok := L.Get(-1); ok.Type() != lua.LTBool || !bool(ok.(lua.LBool)) {
+		atomic.AddUint64(&errorsN, 1)
+	}
+
+	L.Pop(1)
 }
 
-func worker(n int, sleep time.Duration, stop chan struct{}) {
-	state := "__state" + strconv.FormatInt(int64(n), 10)
+func worker(n int) {
+	stateName := "__state" + strconv.FormatInt(int64(n), 10)
 
 	LLock.Lock()
 	{
-		L.CreateTable(0, 0)
-		L.SetGlobal(state)
+		L.SetGlobal(stateName, L.CreateTable(0, 0))
+
+		if workerCb := L.GetGlobal("worker"); workerCb.Type() == lua.LTFunction {
+			if err := L.CallByParam(lua.P{
+				Fn:      workerCb,
+				NRet:    0,
+				Protect: true,
+			}, L.GetGlobal(stateName)); err != nil {
+				log.Fatal(err)
+			}
+		}
 	}
 	LLock.Unlock()
 
+	start.Wait()
+
 	for {
-		var (
-			next = time.Now().Add(sleep)
-			req  *http.Request
-		)
-
-		LLock.Lock()
-		{
-			L.GetGlobal("request")
-			if !L.IsFunction(-1) {
-				log.Fatal(fmt.Errorf("request is not a function"))
-			}
-
-			L.GetGlobal(state)
-			if err := L.Call(1, 1); err != nil {
-				log.Fatal(err)
-			}
-
-			if !L.IsTable(-1) {
-				log.Fatal(fmt.Errorf("request did not return a table but a %s", L.Typename(int(L.Type(-1)))))
-			}
-
-			L.PushString("method")
-			L.GetTable(-2)
-
-			if !L.IsString(-1) {
-				log.Fatal(fmt.Errorf("method is not a string"))
-			}
-
-			method := L.ToString(-1)
-			L.Pop(1)
-
-			L.PushString("url")
-			L.GetTable(-2)
-
-			if !L.IsString(-1) {
-				log.Fatal(fmt.Errorf("url is not a string"))
-			}
-
-			url := L.ToString(-1)
-			L.Pop(1)
-
-			var err error
-			req, err = http.NewRequest(method, url, nil)
-			if err != nil {
-				log.Fatal(err)
-			}
-
-			L.PushString("headers")
-			L.GetTable(-2)
-
-			if !L.IsNoneOrNil(-1) {
-				if !L.IsTable(-1) {
-					log.Fatal(fmt.Errorf("headers is not a table"))
+		for {
+			limit, sleep := rate.Try()
+			if !limit {
+				select {
+				case <-stop:
+					return
+				default:
 				}
 
-				L.PushNil()
-
-				for L.Next(-2) > 0 {
-					name := L.ToString(-2)
-					value := L.ToString(-1)
-					L.Pop(1)
-
-					req.Header.Add(name, value)
-				}
+				break
 			}
 
-			L.Pop(2) // Pop the headers table and the return value off the stack.
-		}
-		LLock.Unlock()
-
-		start := time.Now()
-
-		if res, err := do(req); err != nil {
-			log.Fatal(err)
-		} else {
-			timingChan <- time.Now().Sub(start)
-
-			body, err := ioutil.ReadAll(res.Body)
-			if err != nil {
-				log.Fatal(err)
-			}
-			res.Body.Close()
-
-			LLock.Lock()
-			{
-				L.GetGlobal("response")
-				if !L.IsFunction(-1) {
-					log.Fatal(fmt.Errorf("response is not a function"))
-				}
-
-				L.CreateTable(0, 2)
-
-				L.PushString("status")
-				L.PushInteger(int64(res.StatusCode))
-				L.RawSet(-3)
-
-				L.PushString("body")
-				L.PushString(string(body))
-				L.RawSet(-3)
-
-				L.PushString("headers")
-				L.CreateTable(0, len(res.Header))
-
-				for name, values := range res.Header {
-					L.PushString(strings.ToLower(name))
-					L.CreateTable(len(values), 0)
-
-					for i, value := range values {
-						L.PushInteger(int64(i + 1))
-						L.PushString(value)
-						L.RawSet(-3)
-					}
-
-					L.RawSet(-3)
-				}
-
-				L.RawSet(-3)
-
-				L.GetGlobal(state)
-				if err := L.Call(2, 1); err != nil {
-					log.Fatal(err)
-				}
-
-				if !L.IsBoolean(-1) || !L.ToBoolean(-1) {
-					atomic.AddUint64(&errors, 1)
-				}
-
-				L.Pop(1) // Pop the return value of the stack.
-			}
-			LLock.Unlock()
-		}
-
-		if delay := next.Sub(time.Now()); delay <= 0 {
 			select {
 			case <-stop:
 				return
-			default:
+			case <-time.After(sleep):
 			}
+		}
+
+		req := buildRequest(stateName)
+		startTime := time.Now()
+
+		if res, err := client.Do(req); err != nil {
+			atomic.AddUint64(&errorsN, 1)
 		} else {
-			select {
-			case <-stop:
-				return
-			case <-time.After(delay):
-			}
+			durationChan <- time.Now().Sub(startTime)
+
+			handleResponse(res, stateName)
 		}
 	}
 }
 
 func main() {
-	cachedns := flag.Bool("cachedns", true, "Cache dns lookups (dns lookup time is included in the request time and might slow things down).")
-	keepalive := flag.Bool("keepalive", true, "Use keepalive connections.")
-	rps := flag.Int("rps", 10, "The maximum number of requests per second.")
-	script := flag.String("script", "simple.lua", "The lua script to run.")
-	workers := flag.Int("workers", 100, "Number of workers to use (number of concurrent requests).")
+	cachedns := flag.Bool("cachedns", true,
+		"Cache dns lookups (dns lookup time is included in the request time and might slow things down)")
+	rps := flag.Int("rps", 10, "The maximum number of requests per second")
+	script := flag.String("script", "", "Optional Lua script to run")
+	workers := flag.Int("workers", 100,
+		"Number of workers to use (number of concurrent requests)")
+	keepalive := flag.Bool("keepalive", true, "Use keepalive connections")
+	compression := flag.Bool("compression", true, "Enable or disable compression")
 	flag.Parse()
-
-	// Don't start more workers than we want to do requests per second.
-	if *workers > *rps {
-		*workers = *rps
-	}
-
-	sleep := time.Duration((float64(time.Second) * float64(*workers)) / float64(*rps))
-
-	fmt.Printf("starting %d worker(s) for %d requests per second\n", *workers, *rps)
-	fmt.Printf("press Ctrl+C to stop and print statistics\n")
-
-	L = lua.NewState()
-	L.OpenLibs()
-	L.Register("print", luaPrint)
-
-	if err := L.DoFile(*script); err != nil {
-		log.Fatal(err)
-	}
 
 	dial := net.Dial
 	if *cachedns {
@@ -330,74 +225,160 @@ func main() {
 		Jar: nil,
 		Transport: &http.Transport{
 			DisableKeepAlives:   !(*keepalive),
-			DisableCompression:  false,
-			MaxIdleConnsPerHost: 64,
+			DisableCompression:  !(*compression),
+			MaxIdleConnsPerHost: *workers,
 			Dial:                dial,
 		},
 	}
 
-	stop := make(chan struct{})
-	start := time.Now()
+	L = lua.NewState()
+	L.OpenLibs()
+	L.Register("print", luaPrint)
+	L.Register("println", luaPrintln)
+	L.Register("exit", luaExit)
+	L.SetGlobal("stop", lua.LChannel(stop))
 
-	for i := 0; i < *workers; i++ {
-		go worker(i, sleep, stop)
+	L.PreloadModule("http", gluahttp.NewHttpModule(client).Loader)
+	L.PreloadModule("json", gluajson.Loader)
+	L.PreloadModule("url", gluaurl.Loader)
+
+	args := L.NewTable()
+	for _, arg := range flag.Args() {
+		args.Append(lua.LString(arg))
+	}
+	L.SetGlobal("args", args)
+
+	if *script == "" {
+		if err := L.DoString(`
+			if #args == 0 then
+				println('No url given')
+				exit(1)
+			end
+
+			function request(state)
+				return {
+					['method' ] = 'GET',
+					['url'    ] = args[1],
+					['headers'] = {
+						['User-Agent'] = 'hench',
+					}
+				}
+			end
+
+			function response(res, state)
+				return res.status == 200
+			end
+		`); err != nil {
+			log.Fatal(err)
+		}
+	} else {
+		if err := L.DoFile(*script); err != nil {
+			log.Fatal(err)
+		}
 	}
 
-	timings := make(Timings, *workers)
+	var workersWg sync.WaitGroup
+
+	workersWg.Add(*workers)
+
+	fmt.Printf("starting %d worker(s) for %d requests per second\n", *workers, *rps)
+	fmt.Printf("press Ctrl+C to stop and print statistics\n")
+
+	start.Add(1)
+	for i := 0; i < *workers; i++ {
+		go func(i int) {
+			defer workersWg.Done()
+			worker(i)
+		}(i)
+	}
+
+	rate = ratelimit.New(float64(*rps), time.Second, 0)
+
+	// Start ticking here so we won't have more than rps
+	// requests after the first tick.
+	secondTicker := time.Tick(time.Second)
+	startTime := time.Now()
+
+	start.Done()
+
+	// Now all workers are firing request and we can start collecting durations.
+
+	durations := make(Durations, 0)
+	durationsN := uint64(0)
 
 	go func() {
-		safe := true
 		for {
 			select {
-			case timing := <-timingChan:
-				if safe {
-					timings = append(timings, timing)
-				}
+			case duration := <-durationChan:
+				durations = append(durations, duration)
+				atomic.AddUint64(&durationsN, 1)
 			case <-stop:
-				safe = false
+				for range durationChan {
+					// Do nothing, just consume so the workers don't hang.
+				}
 			}
 		}
 	}()
 
-	r := 0
-	c := make(chan os.Signal, 1)
+	// While collecting durations we should notify the user every second.
+
+	lastDurationsN := uint64(0)
+	lastErrorsN := uint64(0)
+
+	// Wait for Ctrl+C to stop.
+	c := make(chan os.Signal, 0)
 	signal.Notify(c, os.Interrupt)
 
-print:
+printFor:
 	for {
-		time.Sleep(time.Second)
-
 		select {
 		case <-c:
-			break print
-		default:
+			break printFor
+		case <-stop:
+			break printFor
+		case <-secondTicker:
+			nowDurationsN := atomic.LoadUint64(&durationsN)
+			nowErrorsN := atomic.LoadUint64(&errorsN)
+
+			// Always format the time elapsed as exactly 6 characters.
+			s := "      " + ((time.Now().Sub(startTime) / time.Second) * time.Second).String()
+			fmt.Printf("%s: %d requests %d errors\n", s[len(s)-6:], nowDurationsN-lastDurationsN, nowErrorsN-lastErrorsN)
+
+			lastDurationsN = nowDurationsN
+			lastErrorsN = nowErrorsN
 		}
-
-		nr := len(timings)
-		s := "      " + fmt.Sprint(time.Duration(time.Now().Sub(start)/time.Second)*time.Second)
-
-		fmt.Printf("%s: %d requests\n", s[len(s)-6:], nr-r)
-		r = nr
 	}
 
-	printing = false
-	end := time.Now()
+	stopTime := time.Now()
 
 	// Stop all workers.
-	close(stop)
+	// This might fail if one of the workers also closes the stop channel.
+	// To prevent a panic we wrapt this close in a recover.
+	func() {
+		defer func() {
+			recover()
+		}()
 
-	duration := time.Duration(end.Sub(start)/time.Second) * time.Second
-	ps := float64(len(timings)) / (float64(duration) / float64(time.Second))
+		close(stop)
+	}()
 
-	sort.Sort(timings)
+	// Wait until all workers are done.
+	workersWg.Wait()
 
-	fmt.Printf("\n%d requests in %v\n", len(timings), duration)
-	fmt.Printf("%d error(s)\n", atomic.LoadUint64(&errors))
-	fmt.Printf("requests/sec: %.2f\n", ps)
-	fmt.Printf("latency distribution:\n")
-	fmt.Printf("   50%% %v\n", timings[int(float64(len(timings))*0.50)])
-	fmt.Printf("   75%% %v\n", timings[int(float64(len(timings))*0.75)])
-	fmt.Printf("   90%% %v\n", timings[int(float64(len(timings))*0.90)])
-	fmt.Printf("   99%% %v\n", timings[int(float64(len(timings))*0.99)])
-	fmt.Printf("  100%% %v\n", timings[len(timings)-1])
+	duration := time.Duration(stopTime.Sub(startTime)/time.Millisecond) * time.Millisecond
+	perSecond := float64(durationsN) / (float64(duration) / float64(time.Second))
+
+	sort.Sort(durations)
+
+	fmt.Printf("\n%d successful requests in %v\n", durationsN, duration)
+	fmt.Printf("%d error(s)\n", atomic.LoadUint64(&errorsN))
+	fmt.Printf("successful requests/sec: %.2f\n", perSecond)
+	if durationsN > 0 {
+		fmt.Printf("latency distribution:\n")
+		fmt.Printf("   50%% %v\n", durations[int(float64(durationsN)*0.50)])
+		fmt.Printf("   75%% %v\n", durations[int(float64(durationsN)*0.75)])
+		fmt.Printf("   90%% %v\n", durations[int(float64(durationsN)*0.90)])
+		fmt.Printf("   99%% %v\n", durations[int(float64(durationsN)*0.99)])
+		fmt.Printf("  100%% %v\n", durations[durationsN-1])
+	}
 }
