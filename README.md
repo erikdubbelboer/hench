@@ -7,7 +7,7 @@ The Http bENCHmark tool.
 
 Installing (requires go 1.4 or newer):
 ```bash
-go get github.com/atomx/hench
+go get github.com/erikdubbelboer/hench
 ```
 
 Running:
