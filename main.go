@@ -44,20 +44,30 @@ var (
 func luaPrint(L *lua.LState) int {
 	fmt.Print(L.Get(1).String())
 
-	return 1
+	return 0
 }
 
 func luaPrintln(L *lua.LState) int {
 	fmt.Println(L.Get(1).String())
 
-	return 1
+	return 0
 }
 
 func luaExit(L *lua.LState) int {
 	c, _ := L.Get(1).(lua.LNumber)
 	os.Exit(int(c))
 
-	return 1
+	return 0
+}
+
+func luaStop(L *lua.LState) int {
+	defer func() {
+		recover()
+	}()
+
+	close(stop)
+
+	return 0
 }
 
 func buildRequest(stateName string) *http.Request {
@@ -75,7 +85,7 @@ func buildRequest(stateName string) *http.Request {
 	tableVal := L.Get(-1)
 
 	if tableVal.Type() != lua.LTTable {
-		log.Fatal(fmt.Errorf("request did not return a table but a %s", tableVal.Type()))
+		return nil
 	}
 
 	table := tableVal.(*lua.LTable)
@@ -193,6 +203,10 @@ func worker(n int) {
 		}
 
 		req := buildRequest(stateName)
+		if req == nil {
+			continue
+		}
+
 		startTime := time.Now()
 
 		if res, err := client.Do(req); err != nil {
@@ -236,7 +250,7 @@ func main() {
 	L.Register("print", luaPrint)
 	L.Register("println", luaPrintln)
 	L.Register("exit", luaExit)
-	L.SetGlobal("stop", lua.LChannel(stop))
+	L.Register("stop", luaStop)
 
 	L.PreloadModule("http", gluahttp.NewHttpModule(client).Loader)
 	L.PreloadModule("json", gluajson.Loader)

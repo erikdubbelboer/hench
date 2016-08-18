@@ -16,6 +16,6 @@ function response(res, state)
 
 	println(d.bar)
 
-  return res.status ~= 200
+  return res.status == 200
 end
 

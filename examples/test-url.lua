@@ -11,6 +11,8 @@ u = url.parse(args[1])
 u.host = '127.0.0.1:9090'
 u = url.build(u)
 
+println('using ' .. u)
+
 function request(state)
   return {
     ['method' ] = 'GET',
@@ -19,6 +21,6 @@ function request(state)
 end
 
 function response(res, state)
-  return res.status ~= 200
+  return res.status == 200
 end
 

@@ -3,15 +3,20 @@ local http = require('http')
 local tools = require('tools')
 
 -- For more options see: https://github.com/cjoudrey/gluahttp
-response, err = http.get('http://dubbelboer.com/hench-urls.txt')
+local res, err = http.get('http://dubbelboer.com/hench-urls.txt')
 if err ~= nil then
 	println(err)
-	stop:close()
+	stop()
 end
 
-urls = tools.split(response.body, '\n')
+local urls = tools.split(res.body, '\n')
+local wait = #urls
 
 function request(state)
+	if #urls == 0 then
+		return -- Do nothing.
+	end
+
 	local url = table.remove(urls, 1)
 
 	println(url)
@@ -23,10 +28,12 @@ function request(state)
 end
 
 function response(res, state)
-	if #urls == 0 then
-		stop:close()
+	-- Only stop when all responses are received.
+	wait = wait - 1
+	if wait == 0 then
+		stop()
 	end
 
-  return res.status ~= 200
+  return res.status == 200
 end
 

@@ -12,7 +12,7 @@ function response(res, state)
 	counter = counter + 1
 
 	if counter == 30 then
-		stop:close()
+		stop()
 	end
 
   return true
